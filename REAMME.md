@@ -21,7 +21,8 @@ Unlike traditional solvers, it doesn’t just provide ready-made answers — ins
    Create a `.env` file in the project root and add your API key:  
    ```env
    API_KEY=your_api_key_here
-
+   
+---
 
 ## Install Dependencies  
 
@@ -39,3 +40,66 @@ pip install -r requirements.txt
 
 ## ▶️ How To Run
 Type streamlit run main.py in your terminal 
+
+## Team Information
+
+#### Team Leader
+
+Name: Inayat Rumi
+
+Institute: University Of Chitral
+
+Phone: +92 3430372094
+
+Email: rumeinayat@gmail.com
+
+---
+
+#### Member 1
+
+Name: Javeria Rehman
+
+Institute: University Of Chitral
+
+Phone: +92 322 5610755
+
+Email: javeria7864@gmail.com
+
+#### Member 2
+
+Name: Iman Khalid 
+
+Institute: University Of Chitral
+
+Phone: +92 346 0705520
+
+Email: imankhalidbl@gmail.com
+
+----
+#### Member 3
+
+Name: Rubaba Bashir
+
+Institute: University Of Chitral
+
+Phone:  +92 323 8694044
+
+Email: rubababashir638@gmail.com
+
+---
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
