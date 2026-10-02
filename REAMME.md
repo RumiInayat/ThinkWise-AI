@@ -36,5 +36,6 @@ or
 pip install -r requirements.txt
 
 ---
-##▶️ How To Run
+
+## ▶️ How To Run
 Type streamlit run main.py in your terminal 
