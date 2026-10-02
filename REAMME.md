@@ -8,7 +8,6 @@ Unlike traditional solvers, it doesn’t just provide ready-made answers — ins
 ## ✨ Features
 - AI-powered homework assistance  
 - Encourages critical thinking and problem-solving  
-- Supports both text and image-based queries  
 - Simple, interactive interface with Streamlit  
 
 ---
