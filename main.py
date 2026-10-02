@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI, APIConnectionError, APIStatusError, AuthenticationError, RateLimitError
@@ -60,7 +61,13 @@ st.markdown("""
 # 2. Environment & Client Setup
 # -----------------------------------------------------------------------------
 load_dotenv()
-api_key = os.getenv("API_KEY") or os.getenv("GROQ_API_KEY")
+api_key = os.getenv("GROQ_API_KEY") or os.getenv("API_KEY")
+
+AVAILABLE_MODELS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b"
+]
 
 @st.cache_resource
 def get_groq_client(key):
@@ -71,13 +78,38 @@ def get_groq_client(key):
 
 def clean_latex(text: str) -> str:
     """
-    Fixes common escaping issues with LLM-generated LaTeX in Streamlit.
-    Ensures math blocks maintain clean double/single dollar signs and properly
-    escaped control sequences.
+    Normalize common LLM math delimiters so Streamlit renders the expressions.
     """
     if not text:
         return text
-    
+
+    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text, flags=re.DOTALL)
+    text = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', text, flags=re.DOTALL)
+
+    # Some models put LaTeX in ordinary parentheses instead of math delimiters.
+    pairs = []
+    open_parens = []
+    for index, character in enumerate(text):
+        if character == "(":
+            open_parens.append(index)
+        elif character == ")" and open_parens:
+            start = open_parens.pop()
+            expression = text[start + 1:index]
+            commands = re.sub(r'\\[A-Za-z]+', '', expression)
+            if (
+                re.search(r'\\[A-Za-z]+', expression)
+                and not re.search(r'[A-Za-z]{3,}', commands)
+                and text[:start].count("$") % 2 == 0
+            ):
+                pairs.append((start, index))
+
+    outer_pairs = [
+        pair for pair in pairs
+        if not any(start < pair[0] and end > pair[1] for start, end in pairs)
+    ]
+    for start, end in reversed(outer_pairs):
+        text = text[:start] + "$" + text[start + 1:end] + "$" + text[end + 1:]
+
     # Ensure display math $$...$$ is surrounded by newlines for clean KaTeX parsing
     text = re.sub(r'([^\n])\$\$(.*?)\$\$', r'\1\n\n$$\2$$\n\n', text, flags=re.DOTALL)
     
@@ -104,13 +136,18 @@ with st.sidebar:
     st.title("⚙️ Tutor Settings")
     
     selected_model = st.selectbox(
-        "Select AI Model:",
-        [
-            "openai/gpt-oss-20b",
-            "qwen/qwen3.8-27b",
-            "openai/gpt-oss-120b"
-        ],
-        index=2
+        "Primary AI Model:",
+        AVAILABLE_MODELS,
+        index=0,
+        help="Main model used for Socratic dialogue generation."
+    )
+
+    fallback_options = [m for m in AVAILABLE_MODELS if m != selected_model]
+    fallback_model = st.selectbox(
+        "Fallback AI Model:",
+        fallback_options,
+        index=0,
+        help="Automatically engaged if the primary model faces rate limits or downtime."
     )
     
     subject = st.selectbox(
@@ -126,20 +163,24 @@ with st.sidebar:
     
     st.divider()
     
-    # Concept Progress Tracker
+    # Concept Progress Tracker (AI-Driven)
     st.subheader("💡 Session Progress")
-    new_concept = st.text_input("Add mastered concept:", placeholder="e.g., Integration by Parts")
-    if st.button("➕ Log Concept") and new_concept:
-        if new_concept not in st.session_state.learned_concepts:
-            st.session_state.learned_concepts.append(new_concept)
-            st.rerun()
+    st.caption("🤖 Concepts are automatically extracted by AI as you converse.")
 
     if st.session_state.learned_concepts:
-        st.write("**Mastered Topics:**")
+        st.write(f"**Mastered Topics ({len(st.session_state.learned_concepts)}):**")
         for concept in st.session_state.learned_concepts:
             st.markdown(f"- ✅ `{concept}`")
     else:
-        st.caption("No topics logged yet. Track your progress here!")
+        st.caption("No topics tracked yet. Start learning to see AI-extracted concepts here!")
+
+    with st.expander("➕ Add concept manually (optional)"):
+        manual_concept = st.text_input("Concept title:", placeholder="e.g., Integration by Parts", key="manual_concept_input")
+        if st.button("➕ Log Manually") and manual_concept:
+            clean_concept = manual_concept.strip()
+            if clean_concept and clean_concept.lower() not in [c.lower() for c in st.session_state.learned_concepts]:
+                st.session_state.learned_concepts.append(clean_concept)
+                st.rerun()
 
     st.divider()
     
@@ -150,7 +191,7 @@ with st.sidebar:
 
 
 # -----------------------------------------------------------------------------
-# 5. Socratic Prompting & Response Handler
+# 5. Socratic Prompting, Fallback Handler & AI Concept Extraction
 # -----------------------------------------------------------------------------
 def construct_system_prompt(subject_name, style):
     return f"""You are an expert, supportive Socratic AI Tutor specializing in {subject_name}.
@@ -159,7 +200,7 @@ Your goal is to lead the user to discover solutions on their own through guided 
 PEDAGOGICAL RULES ({style}):
 1. NEVER directly solve the user's homework, write full production code solutions, or give final numerical answers.
 2. Structure your response in two parts:
-   - Part 1: Acknowledge their response or provide a minimal hint/context (1-2 sentences max).
+   - Part 1: Acknowledge their response or provide a minimal hint/context.
    - Part 2: End with EXACTLY ONE clear, open-ended question that guides them to the next logical step.
 3. If the user asks for direct answers or complete code, politely decline and ask a simpler prerequisite question.
 
@@ -169,34 +210,120 @@ FORMATTING RULES FOR MATHEMATICS (CRITICAL):
   * Display math: standalone blocks surrounded by double dollar signs on separate lines:
     $$\\int_0^1 x^2 \\, dx$$
 - Do NOT use `\\[ ... \\]` or `\\( ... \\)` brackets. Use ONLY `$` and `$$`.
+- Never wrap LaTeX in ordinary parentheses; every mathematical expression must use `$...$` or `$$...$$`.
 - Always write explicit multiplication and complete mathematical operators.
 """
 
-def generate_ai_response(client, model, messages, subject_name, style):
+def generate_ai_response(client, primary_model, fallback_model, messages, subject_name, style):
+    """
+    Generates a tutor response using the primary model with automatic fallback
+    resilience if rate limits, status errors, or server connection issues arise.
+    """
     system_message = {"role": "system", "content": construct_system_prompt(subject_name, style)}
     full_conversation = [system_message] + messages
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
+    def _call_model(model_name):
+        return client.chat.completions.create(
+            model=model_name,
             messages=full_conversation,
             temperature=0.3,
             max_tokens=450,
         )
-        raw_content = response.choices[0].message.content
-        cleaned_content = clean_latex(raw_content)
-        return cleaned_content, None
 
+    # 1. Attempt generation with primary model
+    try:
+        response = _call_model(primary_model)
+        raw_content = response.choices[0].message.content
+        return clean_latex(raw_content), None, False
+    except (RateLimitError, APIStatusError, APIConnectionError) as primary_err:
+        # 2. Seamlessly failover to fallback model
+        if fallback_model and fallback_model != primary_model:
+            try:
+                response = _call_model(fallback_model)
+                raw_content = response.choices[0].message.content
+                return clean_latex(raw_content), None, True
+            except Exception as fallback_err:
+                return None, f"⚠️ **Model Service Failure:**\n- Primary ({primary_model}): {primary_err}\n- Fallback ({fallback_model}): {fallback_err}", False
+        else:
+            return None, f"⚠️ **Groq API Error ({primary_model}):** {str(primary_err)}", False
     except AuthenticationError:
-        return None, "🔑 **Authentication Error:** Invalid Groq API key. Check your key in `.env` or sidebar."
-    except RateLimitError:
-        return None, "⏳ **Rate Limit Exceeded:** Too many requests in a short time. Please wait a moment."
-    except APIConnectionError:
-        return None, "🌐 **Network Error:** Could not connect to Groq servers. Check your internet connection."
-    except APIStatusError as e:
-        return None, f"⚠️ **Groq API Error ({e.status_code}):** {e.message}"
+        return None, "🔑 **Authentication Error:** Invalid Groq API key. Please check `GROQ_API_KEY` in your `.env` file.", False
     except Exception as e:
-        return None, f"❌ **Unexpected Error:** {str(e)}"
+        return None, f"❌ **Unexpected Error:** {str(e)}", False
+
+def extract_concepts_ai(client, primary_model, fallback_model, messages, existing_concepts):
+    """
+    Automated AI Concept Extraction:
+    Analyzes the recent conversation turns and automatically detects 1-3 specific
+    academic/technical concepts or skills the student is practicing or understanding.
+    """
+    if not messages:
+        return []
+
+    recent_dialogue = messages[-4:]
+    formatted_chat = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in recent_dialogue])
+    existing_str = ", ".join(existing_concepts) if existing_concepts else "None"
+
+    extraction_prompt = f"""You are an educational curriculum assessor.
+Analyze the following tutor-student dialogue. Identify 1 to 2 specific educational concepts, principles, techniques, or topics that the student is exploring, practicing, or has demonstrated understanding of.
+
+Rules:
+- Concept names should be concise (2 to 4 words, e.g., "Chain Rule", "Binary Search Trees", "Newton's Second Law").
+- Do NOT include generic conversational terms like "Question", "Help", "Homework", or "Code".
+- Do NOT return concepts already in this tracked list: [{existing_str}].
+- Output MUST be a valid JSON array of strings only. Example: ["Breadth-First Search", "Queue Data Structure"]
+- If no specific academic or technical concept is identified or newly introduced, return an empty array: []
+
+Dialogue:
+{formatted_chat}
+
+JSON Array:"""
+
+    def _call_extraction(model_name):
+        return client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": extraction_prompt}],
+            temperature=0.1,
+            max_tokens=80,
+        )
+
+    response_text = None
+    try:
+        resp = _call_extraction(primary_model)
+        response_text = resp.choices[0].message.content
+    except Exception:
+        if fallback_model and fallback_model != primary_model:
+            try:
+                resp = _call_extraction(fallback_model)
+                response_text = resp.choices[0].message.content
+            except Exception:
+                return []
+        else:
+            return []
+
+    if not response_text:
+        return []
+
+    try:
+        match = re.search(r'\[.*?\]', response_text, re.DOTALL)
+        if match:
+            extracted = json.loads(match.group(0))
+            if isinstance(extracted, list):
+                cleaned = []
+                for c in extracted:
+                    if isinstance(c, str):
+                        clean_c = c.strip()
+                        if (
+                            clean_c
+                            and clean_c.lower() not in [e.lower() for e in existing_concepts]
+                            and clean_c.lower() not in ["none", "null", "[]"]
+                        ):
+                            cleaned.append(clean_c)
+                return cleaned
+    except Exception:
+        pass
+
+    return []
 
 
 # -----------------------------------------------------------------------------
@@ -245,7 +372,7 @@ elif user_input:
 
 if prompt_to_send:
     if not api_key:
-        st.error("Please provide a valid Groq API Key in the sidebar or `.env` file to continue.")
+        st.error("🔑 **Groq API Key Missing:** Please configure `GROQ_API_KEY` (or `API_KEY`) in your `.env` file to start tutoring.")
     else:
         client = get_groq_client(api_key)
 
@@ -257,9 +384,10 @@ if prompt_to_send:
         # Generate Assistant Response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                reply, error_msg = generate_ai_response(
+                reply, error_msg, used_fallback = generate_ai_response(
                     client, 
                     selected_model, 
+                    fallback_model,
                     st.session_state.messages, 
                     subject, 
                     guidance_level
@@ -268,5 +396,20 @@ if prompt_to_send:
                 if error_msg:
                     st.error(error_msg)
                 else:
+                    if used_fallback:
+                        st.info(f"ℹ️ Primary model was unavailable; seamlessly switched to fallback model `{fallback_model}`.")
                     st.markdown(reply)
                     st.session_state.messages.append({"role": "assistant", "content": reply})
+
+                    # Automated Concept Extraction
+                    new_concepts = extract_concepts_ai(
+                        client,
+                        selected_model,
+                        fallback_model,
+                        st.session_state.messages,
+                        st.session_state.learned_concepts
+                    )
+                    if new_concepts:
+                        st.session_state.learned_concepts.extend(new_concepts)
+                        st.toast(f"💡 AI tracked new concept: {', '.join(new_concepts)}")
+                        st.rerun()
